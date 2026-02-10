@@ -1,0 +1,789 @@
+# server_sync_stable.py
+import json
+import logging
+import re
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from hashlib import sha1
+from typing import Optional, Dict, Any
+
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ================== НАСТРОЙКИ ==================
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.1:8b"
+MCP_URL = "https://localhost/roznica_mcp_test/hs/mcp"
+
+MAX_STEPS = 15
+LLM_TIMEOUT = 1800
+MCP_TIMEOUT = 30
+LLM_MAX_RETRIES = 3
+LLM_RETRY_DELAY = 2
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("LLM-Orchestrator")
+
+# ================== SYSTEM PROMPT ==================
+SYSTEM_PROMPT = """
+Ты — аналитический orchestrator.
+
+ВАЖНЕЙШИЕ ПРАВИЛА:
+1. Ты должен отвечать **ТОЛЬКО чистым JSON** без каких-либо дополнительных текстов
+2. Не используй ```json ```, ` ``, или другие обрамляющие теги
+3. Не добавляй текст перед JSON или после него
+4. Твой ответ должен начинаться с '{' и заканчивается '}'
+5. JSON должен быть полностью валидным и соответствовать одному из форматов ниже
+
+ФОРМАТЫ ОТВЕТА:
+
+1) Для вызова инструмента:
+{
+  "action": "call_tool",
+  "name": "имя_инструмента",
+  "arguments": {
+    "ключ": "значение"
+  }
+}
+
+2) Для финального ответа:
+{
+  "action": "final",
+  "Text": "краткое текстовое описание результата",
+  "Result": { ... }  // Здесь должны быть ПОЛНЫЕ данные из инструментов
+}
+
+ВАЖНО:
+- В поле "Result" помещай ПОЛНЫЕ данные, полученные от инструментов
+- В поле "Text" пиши только краткое описание того, что в Result
+- Не обрезай данные в поле Result
+- Если данные большие, возвращай их полностью в Result
+- Не добавляй никаких дополнительных полей кроме "action", "Text" и "Result"
+
+ОБЩИЕ ПРИНЦИПЫ РАБОТЫ:
+- Внимательно анализируй запрос пользователя
+- Используй инструменты для получения информации
+- Если инструмент возвращает ошибку, анализируй её и исправляй аргументы
+- Если для выполнения запроса требуется сначала получить список объектов, сделай это
+- Выбирай наиболее подходящие аргументы для инструментов на основе контекста
+- Если данных достаточно — возвращай финальный ответ
+- Используй точные названия инструментов из списка доступных
+- Не повторяй одинаковые вызовы инструментов
+"""
+
+
+# ================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==================
+def find_valid_json(text: str) -> Optional[str]:
+    """Находит валидный JSON объект в строке с учетом вложенности"""
+    # Очищаем от markdown блоков
+    text = re.sub(r'```json\s*', '', text)
+    text = re.sub(r'```\s*', '', text)
+    text = text.strip()
+    
+    # Ищем первую открывающую фигурную скобку
+    start = text.find('{')
+    if start == -1:
+        return None
+    
+    # Ищем соответствующую закрывающую скобку с учетом вложенности
+    balance = 0
+    end = start
+    
+    for i in range(start, len(text)):
+        char = text[i]
+        if char == '{':
+            balance += 1
+        elif char == '}':
+            balance -= 1
+            if balance == 0:
+                end = i
+                break
+    
+    if balance != 0:
+        # Если баланс не сошелся, пытаемся найти любую закрывающую скобку
+        last_close = text.rfind('}')
+        if last_close > start:
+            end = last_close
+        else:
+            return None
+    
+    json_candidate = text[start:end + 1]
+    
+    # Проверяем минимальную валидность
+    if json_candidate.startswith('{') and json_candidate.endswith('}'):
+        return json_candidate
+    
+    return None
+
+
+def validate_json_structure(data: Dict[str, Any]) -> bool:
+    """Проверяет структуру JSON ответа от LLM"""
+    if not isinstance(data, dict):
+        return False
+    
+    action = data.get('action')
+    if action not in ['call_tool', 'final']:
+        return False
+    
+    if action == 'call_tool':
+        required = ['name', 'arguments']
+        return all(key in data for key in required)
+    elif action == 'final':
+        required = ['Text', 'Result']
+        return all(key in data for key in required)
+    
+    return False
+
+
+def analyze_ollama_error(error: Exception, response: Optional[requests.Response] = None) -> Dict[str, Any]:
+    """Анализирует ошибку Ollama и возвращает структурированное описание"""
+    error_info = {
+        "type": "unknown",
+        "message": str(error),
+        "details": {}
+    }
+    
+    try:
+        error_str = str(error).lower()
+        
+        # Проверяем наличие информации в response
+        if response is not None:
+            try:
+                response_data = response.json()
+                if 'error' in response_data:
+                    error_info['details']['ollama_error'] = response_data['error']
+            except:
+                pass
+        
+        # Определяем тип ошибки по ключевым словам
+        if 'memory' in error_str or 'requires more system memory' in error_str:
+            error_info['type'] = "memory_error"
+            error_info['message'] = "Недостаточно памяти для обработки запроса"
+            
+            # Извлекаем информацию о памяти из сообщения
+            import re
+            memory_match = re.search(r'(\d+\.?\d*)\s*GiB', error_str)
+            if memory_match:
+                error_info['details']['required_memory'] = memory_match.group(1) + " GiB"
+            
+            memory_match = re.search(r'available\s*(\d+\.?\d*)\s*GiB', error_str)
+            if memory_match:
+                error_info['details']['available_memory'] = memory_match.group(1) + " GiB"
+                
+        elif 'timeout' in error_str or 'timed out' in error_str:
+            error_info['type'] = "timeout_error"
+            error_info['message'] = "Превышено время ожидания ответа от LLM"
+            
+        elif 'connection' in error_str or 'refused' in error_str:
+            error_info['type'] = "connection_error"
+            error_info['message'] = "Не удалось подключиться к серверу LLM"
+            
+        elif 'model' in error_str and 'not found' in error_str:
+            error_info['type'] = "model_error"
+            error_info['message'] = f"Модель '{OLLAMA_MODEL}' не найдена"
+            
+        elif 'context length' in error_str or 'num_ctx' in error_str:
+            error_info['type'] = "context_error"
+            error_info['message'] = "Запрос слишком длинный для контекста модели"
+            
+        elif '500' in error_str or 'internal server error' in error_str:
+            error_info['type'] = "server_error"
+            error_info['message'] = "Внутренняя ошибка сервера LLM"
+            
+    except Exception as e:
+        logger.warning(f"Ошибка при анализе ошибки Ollama: {e}")
+    
+    return error_info
+
+
+def get_error_suggestion(error_type: str) -> str:
+    """Возвращает подсказку для пользователя в зависимости от типа ошибки"""
+    suggestions = {
+        "memory_error": "Недостаточно оперативной памяти. Попробуйте упростить запрос или увеличьте объем оперативной памяти.",
+        "timeout_error": "Превышено время ожидания. Попробуйте упростить запрос или увеличьте таймаут.",
+        "connection_error": "Проблема с подключением к серверу LLM. Проверьте, запущен ли сервер Ollama.",
+        "model_error": f"Модель {OLLAMA_MODEL} не найдена. Убедитесь, что модель загружена в Ollama.",
+        "context_error": "Запрос слишком длинный для модели. Попробуйте упростить запрос.",
+        "server_error": "Внутренняя ошибка сервера LLM. Попробуйте позже или перезапустите сервер Ollama.",
+        "invalid_response": "LLM вернула некорректный ответ. Попробуйте переформулировать запрос.",
+        "unknown": "Неизвестная ошибка. Попробуйте еще раз."
+    }
+    return suggestions.get(error_type, suggestions["unknown"])
+
+
+def create_success_response(text: str, result: Any) -> Dict[str, Any]:
+    """Создает стандартный успешный ответ"""
+    return {
+        "Success": True,
+        "Text": text,
+        "Result": result
+    }
+
+
+def create_error_response(text: str, error_type: str = "unknown", details: Optional[Dict] = None, success: bool = False) -> Dict[str, Any]:
+    """Создает стандартный ответ с ошибкой"""
+    return {
+        "Success": success,
+        "Text": text,
+        "Result": {
+            "error_type": error_type,
+            "details": details or {},
+            "suggestion": get_error_suggestion(error_type)
+        }
+    }
+
+
+def is_error_result(result: Dict[str, Any]) -> bool:
+    """Проверяет, является ли результат ошибкой"""
+    if not isinstance(result, dict):
+        return False
+    
+    # Если есть поле error_type, это ошибка
+    if "error_type" in result:
+        return True
+    
+    # Если это результат от MCP инструмента с isError = True
+    if result.get("isError", False):
+        return True
+    
+    # Если в content есть сообщение об ошибке
+    if isinstance(result.get("content"), list) and len(result["content"]) > 0:
+        first_item = result["content"][0]
+        if isinstance(first_item, dict) and "text" in first_item:
+            error_text = first_item["text"].lower()
+            if any(word in error_text for word in ["ошибка", "error", "exception", "failed"]):
+                return True
+    
+    return False
+
+
+# ================== MCP ==================
+def mcp_request(payload):
+    try:
+        r = requests.post(MCP_URL, json=payload, timeout=MCP_TIMEOUT, verify=False)
+        if r.status_code == 204 or not r.text.strip():
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning("Ошибка MCP запроса: %s", e)
+        return {"result": {"content": [], "isError": True}}
+
+
+def mcp_initialize():
+    logger.info("MCP initialize")
+    mcp_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+
+
+def mcp_list_tools():
+    data = mcp_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+    if not data or "result" not in data:
+        return []
+    return data["result"].get("tools", [])
+
+
+def mcp_call_tool(name, arguments):
+    payload = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+    logger.info("MCP CALL: %s %s", name, arguments)
+    data = mcp_request(payload)
+    result = data.get("result", {"content": [], "isError": False}) if data else {"content": [], "isError": False}
+    return result
+
+
+# ================== LLM ==================
+def warmup_llm():
+    try:
+        requests.post(
+            OLLAMA_URL,
+            json={"model": OLLAMA_MODEL, "prompt": "Ответь: OK", "stream": False},
+            timeout=LLM_TIMEOUT
+        )
+        logger.info("LLM прогрета")
+    except Exception as e:
+        logger.warning("Ошибка прогрева LLM: %s", e)
+
+
+def call_llm(prompt: str) -> Dict[str, Any]:
+    """Вызывает LLM с анализом ошибок и возвратом структурированной информации"""
+    for attempt in range(LLM_MAX_RETRIES):
+        try:
+            logger.debug(f"Попытка {attempt + 1}/{LLM_MAX_RETRIES} запроса к LLM")
+            
+            r = requests.post(
+                OLLAMA_URL,
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.0,
+                        "num_ctx": 100000,
+                        "num_predict": 4096,
+                        "top_p": 0.9,
+                        "repeat_penalty": 1.1
+                    }
+                },
+                timeout=LLM_TIMEOUT
+            )
+            
+            # Проверяем статус ответа
+            if r.status_code != 200:
+                error_info = analyze_ollama_error(
+                    Exception(f"HTTP {r.status_code}: {r.text[:200]}"),
+                    r
+                )
+                
+                logger.warning(f"Ошибка HTTP {r.status_code} от LLM: {error_info}")
+                
+                # Возвращаем структурированную информацию об ошибке
+                return {
+                    "action": "final",
+                    "Text": error_info['message'],
+                    "Result": {
+                        "error_type": error_info['type'],
+                        "details": error_info['details'],
+                        "suggestion": get_error_suggestion(error_info['type'])
+                    }
+                }
+            
+            r.raise_for_status()
+            
+            response_data = r.json()
+            raw_text = response_data.get("response", "")
+            
+            # Извлекаем JSON из ответа
+            json_str = find_valid_json(raw_text)
+            
+            if not json_str:
+                logger.warning(f"JSON не найден в ответе LLM (попытка {attempt + 1})")
+                if attempt < LLM_MAX_RETRIES - 1:
+                    time.sleep(LLM_RETRY_DELAY * (attempt + 1))
+                    continue
+                raise ValueError("LLM вернула не JSON")
+            
+            # Парсим JSON
+            try:
+                result = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Ошибка парсинга JSON (попытка {attempt + 1}): {e}")
+                if attempt < LLM_MAX_RETRIES - 1:
+                    time.sleep(LLM_RETRY_DELAY * (attempt + 1))
+                    continue
+                raise
+            
+            # Проверяем структуру
+            if not validate_json_structure(result):
+                logger.warning(f"Неверная структура JSON (попытка {attempt + 1}): {result}")
+                if attempt < LLM_MAX_RETRIES - 1:
+                    time.sleep(LLM_RETRY_DELAY * (attempt + 1))
+                    continue
+                raise ValueError("Неверная структура JSON ответа")
+            
+            return result
+            
+        except requests.RequestException as e:
+            error_info = analyze_ollama_error(e)
+            logger.warning(f"Ошибка соединения с LLM (попытка {attempt + 1}): {error_info}")
+            
+            if attempt < LLM_MAX_RETRIES - 1:
+                time.sleep(LLM_RETRY_DELAY * (attempt + 1))
+                continue
+            else:
+                return {
+                    "action": "final",
+                    "Text": error_info['message'],
+                    "Result": {
+                        "error_type": error_info['type'],
+                        "details": error_info['details'],
+                        "suggestion": get_error_suggestion(error_info['type'])
+                    }
+                }
+                
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Ошибка данных от LLM (попытка {attempt + 1}): {e}")
+            if attempt < LLM_MAX_RETRIES - 1:
+                time.sleep(LLM_RETRY_DELAY * (attempt + 1))
+                continue
+            else:
+                return {
+                    "action": "final",
+                    "Text": "LLM вернула некорректный ответ",
+                    "Result": {
+                        "error_type": "invalid_response",
+                        "details": {"error": str(e)},
+                        "suggestion": "Попробуйте переформулировать запрос"
+                    }
+                }
+                
+        except Exception as e:
+            error_info = analyze_ollama_error(e)
+            logger.error(f"Неожиданная ошибка в call_llm: {error_info}")
+            
+            if attempt < LLM_MAX_RETRIES - 1:
+                time.sleep(LLM_RETRY_DELAY * (attempt + 1))
+                continue
+            else:
+                return {
+                    "action": "final",
+                    "Text": error_info['message'],
+                    "Result": {
+                        "error_type": error_info['type'],
+                        "details": error_info['details'],
+                        "suggestion": get_error_suggestion(error_info['type'])
+                    }
+                }
+
+
+# ================== PROMPT ==================
+def build_prompt(messages, tools, include_tools):
+    parts = [SYSTEM_PROMPT.strip()]
+    
+    if include_tools and tools:
+        parts.append("ДОСТУПНЫЕ ИНСТРУМЕНТЫ:")
+        for t in tools.values():
+            tool_desc = f"{t['name']}: {t.get('description', 'Без описания')}"
+            input_schema = t.get('inputSchema', {})
+            if input_schema:
+                tool_desc += f"\nПараметры: {json.dumps(input_schema, ensure_ascii=False)}"
+            parts.append(tool_desc)
+    
+    for m in messages:
+        if m["role"] == "user":
+            parts.append(f"ВОПРОС ПОЛЬЗОВАТЕЛЯ:\n{m['content']}")
+        elif m["role"] == "tool":
+            content = m['content']
+            
+            # Форматируем результат для лучшей читаемости
+            if isinstance(content, dict):
+                # Если есть ошибка, выделяем её
+                if content.get('isError', False):
+                    parts.append("РЕЗУЛЬТАТ ИНСТРУМЕНТА (ОШИБКА):")
+                    
+                    # Извлекаем текст ошибки если есть
+                    error_text = ""
+                    if 'content' in content and isinstance(content['content'], list) and len(content['content']) > 0:
+                        first_item = content['content'][0]
+                        if isinstance(first_item, dict) and 'text' in first_item:
+                            error_text = first_item['text']
+                    
+                    if error_text:
+                        parts.append(f"Сообщение об ошибке: {error_text[:500]}")
+                    else:
+                        parts.append(json.dumps(content, ensure_ascii=False, indent=2))
+                    
+                    # Добавляем подсказку для LLM
+                    parts.append("ВНИМАНИЕ: Инструмент вернул ошибку. Проверь правильность аргументов.")
+                
+                # Если это список объектов, показываем в удобном формате
+                elif 'content' in content and isinstance(content['content'], list):
+                    obj_list = content['content']
+                    parts.append(f"РЕЗУЛЬТАТ ИНСТРУМЕНТА (найдено {len(obj_list)} объектов):")
+                    
+                    # Показываем первые 10 объектов для наглядности
+                    for i, item in enumerate(obj_list[:10], 1):
+                        if isinstance(item, dict):
+                            # Выводим наиболее информативные поля
+                            name = item.get('name', item.get('title', 'Без названия'))
+                            parts.append(f"{i}. {name}")
+                            # Показываем дополнительные поля если есть
+                            additional = []
+                            for key in ['type', 'description', 'synonym']:
+                                if key in item and item[key]:
+                                    additional.append(f"{key}: {item[key]}")
+                            if additional:
+                                parts.append(f"   ({', '.join(additional)})")
+                        else:
+                            parts.append(f"{i}. {item}")
+                    
+                    if len(obj_list) > 10:
+                        parts.append(f"... и еще {len(obj_list) - 10} объектов")
+                else:
+                    parts.append(f"РЕЗУЛЬТАТ ИНСТРУМЕНТА:\n{json.dumps(content, ensure_ascii=False, indent=2)}")
+            else:
+                parts.append(f"РЕЗУЛЬТАТ ИНСТРУМЕНТА:\n{json.dumps(content, ensure_ascii=False, indent=2)}")
+    
+    parts.append("\n" + "="*50 + "\nТВОЙ ОТВЕТ (ТОЛЬКО JSON, помни про формат с Text и Result):")
+    
+    return "\n\n".join(parts)
+
+
+def hash_tool_call(name, args):
+    """Создает хэш для уникальной идентификации вызова инструмента"""
+    return sha1(json.dumps({"name": name, "args": args}, sort_keys=True).encode()).hexdigest()
+
+
+# ================== HTTP SERVER ==================
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        """Отключаем стандартное логирование запросов от BaseHTTPRequestHandler"""
+        pass
+    
+    def do_POST(self):
+        start_time = time.time()
+        try:
+            # Чтение запроса
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length == 0:
+                self.reply(400, create_error_response(
+                    "Пустое тело запроса", 
+                    "bad_request",
+                    {"field": "body"},
+                    False
+                ))
+                return
+            
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+            user_text = data.get("text")
+            
+            if not user_text:
+                self.reply(400, create_error_response(
+                    "Поле 'text' обязательно", 
+                    "bad_request",
+                    {"field": "text"},
+                    False
+                ))
+                return
+            
+            logger.info(f"Новый запрос: {user_text[:100]}...")
+            
+            # Инициализация контекста
+            messages = [{"role": "user", "content": user_text}]
+            used_calls = set()
+            last_tool = None
+            repeat_guard = 0
+            
+            # Сохраняем полные результаты инструментов для последующего использования
+            tool_results = []
+            
+            # Основной цикл обработки
+            for step in range(MAX_STEPS):
+                logger.debug(f"Шаг {step + 1}/{MAX_STEPS}")
+                
+                # Строим промпт
+                prompt = build_prompt(
+                    messages, 
+                    AVAILABLE_TOOLS, 
+                    include_tools=(step == 0)
+                )
+                
+                # Вызываем LLM
+                answer = call_llm(prompt)
+                
+                # Обрабатываем ответ
+                action = answer.get("action")
+                
+                if action == "final":
+                    logger.info(f"Запрос завершен за {step + 1} шагов")
+                    
+                    # Определяем, является ли результат ошибкой
+                    result = answer.get("Result", {})
+                    is_error = is_error_result(result)
+                    
+                    if is_error:
+                        # Это ошибка
+                        error_type = result.get("error_type", "unknown")
+                        details = result.get("details", {})
+                        text = answer.get("Text", "Произошла ошибка")
+                        
+                        self.reply(200, create_error_response(
+                            text,
+                            error_type,
+                            details,
+                            False
+                        ))
+                    else:
+                        # Успешный ответ
+                        text = answer.get("Text", "Запрос успешно обработан")
+                        if text in ["", "OK", "Готово"]:
+                            text = "Запрос успешно обработан"
+                        
+                        # Если Result пустой, но у нас есть результаты инструментов, используем их
+                        if not result and tool_results:
+                            result = tool_results[-1] if isinstance(tool_results[-1], dict) else {"data": tool_results[-1]}
+                        
+                        self.reply(200, create_success_response(text, result))
+                    return
+                
+                elif action == "call_tool":
+                    tool = answer.get("name")
+                    args = answer.get("arguments", {})
+                    
+                    # Валидация инструмента
+                    if not tool or tool not in AVAILABLE_TOOLS:
+                        messages.append({
+                            "role": "tool",
+                            "content": {
+                                "error": "НЕИЗВЕСТНЫЙ_ИНСТРУМЕНТ",
+                                "доступные_инструменты": list(AVAILABLE_TOOLS.keys())
+                            }
+                        })
+                        continue
+                    
+                    # Проверка дубликатов
+                    call_hash = hash_tool_call(tool, args)
+                    if call_hash in used_calls:
+                        messages.append({
+                            "role": "tool",
+                            "content": {
+                                "error": "ПОВТОРНЫЙ_ВЫЗОВ",
+                                "инструмент": tool
+                            }
+                        })
+                        continue
+                    
+                    # Проверка зацикливания
+                    if last_tool == tool:
+                        repeat_guard += 1
+                        if repeat_guard >= 3:
+                            logger.warning(f"Зацикливание на инструменте: {tool}")
+                            self.reply(200, create_error_response(
+                                "LLM зациклился на инструменте",
+                                "loop_detected",
+                                {"tool": tool, "steps": step + 1},
+                                False
+                            ))
+                            return
+                    else:
+                        repeat_guard = 0
+                    
+                    # Вызов инструмента
+                    last_tool = tool
+                    used_calls.add(call_hash)
+                    
+                    logger.info(f"Вызов инструмента: {tool} с аргументами: {args}")
+                    result = mcp_call_tool(tool, args)
+                    
+                    # Сохраняем полный результат
+                    tool_results.append(result)
+                    
+                    # Добавляем в историю сообщений
+                    messages.append({
+                        "role": "tool",
+                        "content": result
+                    })
+                    
+                else:
+                    # Неизвестное действие
+                    messages.append({
+                        "role": "tool",
+                        "content": {
+                            "error": "НЕИЗВЕСТНОЕ_ДЕЙСТВИЕ",
+                            "action": action
+                        }
+                    })
+            
+            # Превышено число шагов
+            logger.warning(f"Превышено максимальное число шагов ({MAX_STEPS})")
+            self.reply(200, create_error_response(
+                "Превышено число шагов LLM",
+                "max_steps_exceeded",
+                {"max_steps": MAX_STEPS, "completed_steps": MAX_STEPS},
+                False
+            ))
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка JSON в запросе: {e}")
+            self.reply(400, create_error_response(
+                "Невалидный JSON в запросе",
+                "invalid_json",
+                {"error": str(e)},
+                False
+            ))
+            
+        except Exception as e:
+            logger.exception(f"Неожиданная ошибка при обработке запроса: {e}")
+            self.reply(500, create_error_response(
+                f"Внутренняя ошибка сервера: {str(e)[:100]}",
+                "server_error",
+                {"error": str(e)},
+                False
+            ))
+            
+        finally:
+            elapsed = time.time() - start_time
+            logger.info(f"Запрос обработан за {elapsed:.2f} секунд")
+    
+    def reply(self, code, response_obj):
+        """Отправляет JSON ответ в стандартном формате"""
+        try:
+            # Гарантируем, что response_obj имеет правильную структуру
+            if not isinstance(response_obj, dict):
+                response_obj = create_error_response(
+                    "Неверный формат ответа",
+                    "invalid_response_format",
+                    None,
+                    False
+                )
+            
+            # Проверяем наличие обязательных полей
+            if "Success" not in response_obj:
+                # Автоматически определяем Success по наличию error_type в Result
+                result = response_obj.get("Result", {})
+                if isinstance(result, dict) and "error_type" in result:
+                    response_obj["Success"] = False
+                else:
+                    response_obj["Success"] = True
+            
+            if "Text" not in response_obj:
+                response_obj["Text"] = ""
+            
+            if "Result" not in response_obj:
+                response_obj["Result"] = {}
+            
+            body = json.dumps(response_obj, ensure_ascii=False, indent=2).encode('utf-8')
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            logger.error(f"Ошибка при отправке ответа: {e}")
+            if not self.headers_sent:
+                error_response = create_error_response(
+                    f"Ошибка при отправке ответа: {str(e)[:100]}",
+                    "response_error",
+                    None,
+                    False
+                )
+                error_body = json.dumps(error_response, ensure_ascii=False).encode('utf-8')
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Content-Length', str(len(error_body)))
+                self.end_headers()
+                self.wfile.write(error_body)
+
+
+# ================== START ==================
+if __name__ == "__main__":
+    print("🚀 LLM-Orchestrator запущен: http://localhost:9000")
+    print("=" * 50)
+    
+    try:
+        # Инициализация MCP
+        mcp_initialize()
+        
+        # Загрузка инструментов
+        tools = mcp_list_tools()
+        if not tools:
+            logger.warning("Не загружены инструменты MCP")
+            AVAILABLE_TOOLS = {}
+        else:
+            AVAILABLE_TOOLS = {t["name"]: t for t in tools}
+            logger.info(f"Загружены инструменты ({len(AVAILABLE_TOOLS)}): {list(AVAILABLE_TOOLS.keys())}")
+        
+        # Прогрев LLM
+        warmup_llm()
+        
+        # Запуск сервера
+        server = HTTPServer(("0.0.0.0", 9000), Handler)
+        logger.info("Сервер готов к приему запросов на порту 9000")
+        server.serve_forever()
+        
+    except KeyboardInterrupt:
+        logger.info("Сервер остановлен пользователем")
+    except Exception as e:
+        logger.error(f"Критическая ошибка при запуске сервера: {e}")
+        raise

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:DataProcessor xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="c30c1c59-f536-4fb5-8a96-b7f238fa1712">
+  <producedTypes>
+    <objectType typeId="6c5e390c-f2a9-437a-b69f-1f34bddec02b" valueTypeId="fa11c3ad-7755-4a6a-a454-6263e6a60b1a"/>
+    <managerType typeId="534a997d-a2af-412d-90dd-15e822ddae01" valueTypeId="40b0595b-c797-43a0-a61f-fc1868587cc1"/>
+  </producedTypes>
+  <name>mcp_ИнструментДляБухгалтерскойРаботы</name>
+  <synonym>
+    <key>ru1</key>
+    <value>Mcp инструмент для бухгалтерской работы</value>
+  </synonym>
+  <useStandardCommands>true</useStandardCommands>
+</mdclass:DataProcessor>
