@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mdclass:DataProcessor xmlns:mdclass="http://g5.1c.ru/v8/dt/metadata/mdclass" uuid="83859936-1dca-4373-af3a-1db2143af9fb">
+  <producedTypes>
+    <objectType typeId="7cb58077-3a12-4e4e-b384-461768ddce4f" valueTypeId="9cd122cf-4d34-4c4d-b479-bff95f42c6b2"/>
+    <managerType typeId="f6f8e3e1-1d84-4204-952d-b8bb1f87a9bb" valueTypeId="4372e45c-ba97-4773-aab7-b1e54fac884f"/>
+  </producedTypes>
+  <name>АнализКонфигурацииMCP</name>
+  <synonym>
+    <key>ru</key>
+    <value>Анализ конфигурации MCP</value>
+  </synonym>
+  <synonym>
+    <key>ru1</key>
+    <value>Анализ Конфигурации MCP</value>
+  </synonym>
+  <useStandardCommands>true</useStandardCommands>
+  <defaultForm>DataProcessor.АнализКонфигурацииMCP.Form.Форма</defaultForm>
+  <forms uuid="cc24a492-07f0-4269-bc82-975a05deb68f">
+    <name>Форма</name>
+    <synonym>
+      <key>ru</key>
+      <value>Форма</value>
+    </synonym>
+    <usePurposes>PersonalComputer</usePurposes>
+    <usePurposes>MobileDevice</usePurposes>
+  </forms>
+  <templates uuid="9562f068-b4ad-45fa-b1bd-8379eb940e8a">
+    <name>LLM_Orchestrator</name>
+    <synonym>
+      <key>ru</key>
+      <value>LLM Orchestrator</value>
+    </synonym>
+    <templateType>BinaryData</templateType>
+  </templates>
+</mdclass:DataProcessor>
